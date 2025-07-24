@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT COALESCE((SELECT MAX(seq) FROM labels), 0) AS \"seq!\"\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "096b76f50557e8fee46f6eb22df5d5a7451cf7f44a68b7994163b186e672e95c"
+}
