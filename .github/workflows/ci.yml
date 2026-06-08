@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The committed .sqlx cache lets the query macros typecheck without a database.
+  SQLX_OFFLINE: "true"
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets
+
+  lint:
+    name: lint (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Non-blocking for now: surfaces formatting/lint drift as annotations
+      # without failing the build. Flip continue-on-error off once clean.
+      - run: cargo fmt --all --check
+        continue-on-error: true
+      - run: cargo clippy --all-targets
+        continue-on-error: true
