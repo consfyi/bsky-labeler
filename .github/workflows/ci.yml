@@ -24,7 +24,7 @@ jobs:
       - run: cargo build --all-targets
 
   lint:
-    name: lint (informational)
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -32,9 +32,5 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # Non-blocking for now: surfaces formatting/lint drift as annotations
-      # without failing the build. Flip continue-on-error off once clean.
       - run: cargo fmt --all --check
-        continue-on-error: true
-      - run: cargo clippy --all-targets
-        continue-on-error: true
+      - run: cargo clippy --all-targets -- -D warnings
