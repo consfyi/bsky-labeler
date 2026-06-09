@@ -118,7 +118,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .sign_plc_operation(operation)
         .await?;
 
-    println!("");
+    println!();
     println!("{}", serde_json::to_string_pretty(&plc_op)?);
     println!("Press ENTER to submit this PLC operation, Ctrl+C to cancel.");
     std::io::stdin().read_line(&mut String::new())?;

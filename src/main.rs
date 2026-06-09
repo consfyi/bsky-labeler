@@ -153,7 +153,7 @@ async fn subscribe_labels(
                         let _ = msg?;
                     }
                     msg = notify_recv.changed() => {
-                        let _ = msg?;
+                        msg?;
                         let mut db_conn = db_pool.acquire().await?;
 
                         let mut rows = sqlx::query!(
