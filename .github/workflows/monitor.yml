@@ -1,0 +1,29 @@
+name: monitor
+
+# Liveness check for the deployed labeler. Hits the public /health endpoint,
+# which reports whether the ingester's jetstream cursor is still advancing.
+# A failing (red) scheduled run is the alert: GitHub emails the repo watchers.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    name: probe /health
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe labeler /health
+        run: |
+          code=$(curl -sS -o /tmp/health_body -w "%{http_code}" --max-time 20 \
+            https://bsky-labeler.cons.fyi/health || echo 000)
+          echo "HTTP $code"
+          cat /tmp/health_body || true
+          if [ "$code" != "200" ]; then
+            echo "::error::labeler health check failed (HTTP $code) — ingester may have stalled or the service is down"
+            exit 1
+          fi
