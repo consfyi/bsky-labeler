@@ -198,6 +198,49 @@ async fn subscribe_labels(
     })
 }
 
+/// Liveness check for the ingester. `jetstream_cursor.cursor` is the microsecond
+/// timestamp of the last firehose event the ingester committed; if it stops
+/// advancing, ingestion has stalled. Returns 200 when the cursor is fresh,
+/// 503 (with a short diagnostic body) otherwise so an external probe can alert.
+async fn health(db_pool: sqlx::PgPool) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    // Max acceptable lag between now and the last processed firehose event.
+    const MAX_LAG_SECS: i64 = 600;
+
+    let cursor: Result<Option<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT cursor FROM jetstream_cursor")
+            .fetch_optional(&db_pool)
+            .await;
+
+    match cursor {
+        Ok(Some(cursor_us)) => {
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            let lag_secs = (now_us - cursor_us) / 1_000_000;
+            let body = format!("cursor_us={cursor_us} lag_secs={lag_secs}\n");
+            let status = if lag_secs <= MAX_LAG_SECS {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            };
+            (status, body).into_response()
+        }
+        Ok(None) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no jetstream_cursor row\n",
+        )
+            .into_response(),
+        Err(err) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("db error: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     metrics::describe_gauge!("num_subscriptions", "number of active subscriptions");
@@ -260,6 +303,13 @@ async fn main() -> Result<(), anyhow::Error> {
         .route(
             "/metrics",
             axum::routing::get(|| async move { metrics_handle.render() }),
+        )
+        .route(
+            "/health",
+            axum::routing::get({
+                let db_pool = db_pool.clone();
+                move || health(db_pool.clone())
+            }),
         )
         .route("/", axum::routing::get(|| async { ">:3" }));
 
