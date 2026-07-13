@@ -2,23 +2,74 @@ name: monitor
 
 # Liveness check for the deployed labeler. Hits the public /health endpoint,
 # which reports whether the ingester's jetstream cursor is still advancing.
-# A failing (red) scheduled run is the alert: GitHub emails the repo watchers.
+#
+# Alerting is layered: an external uptime service polling /health is the fast
+# pager; this workflow is the in-repo backstop. On failure (and on the first
+# success after a failure) it posts to the ops Telegram channel via a
+# dedicated ops bot — secrets OPS_TELEGRAM_BOT_TOKEN + OPS_TELEGRAM_CHAT_ID.
+# Missing secrets or a Telegram outage degrade to log-only: alerting problems
+# must never mask the monitor's own red/green signal.
+#
+# NOTE: GitHub throttles scheduled runs on this repo to a handful per day,
+# so detection latency here can be hours — backstop, not pager.
 
 on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a test message through the ops alert path and exit"
+        type: boolean
+        default: false
+      force_fail:
+        description: "Skip the real probe and force a failed /health result, to exercise the failure->Telegram alert path"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read # recovery notice reads the previous run's conclusion
 
 jobs:
   health:
     name: probe /health
     runs-on: ubuntu-latest
+    env:
+      OPS_TOKEN: ${{ secrets.OPS_TELEGRAM_BOT_TOKEN }}
+      OPS_CHAT: ${{ secrets.OPS_TELEGRAM_CHAT_ID }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # Passed via env (not inline ${{ }}) so the run: block stays valid bash for `bash -n`.
+      FORCE_FAIL: ${{ inputs.force_fail }}
     steps:
-      - name: Probe labeler /health
+      - name: Send test alert
+        if: ${{ inputs.test_alert }}
         run: |
+          # A test SHOULD fail loudly when the pipe is unconfigured, unlike the
+          # real alert path below, which degrades to log-only.
+          if [ -z "$OPS_TOKEN" ] || [ -z "$OPS_CHAT" ]; then
+            echo "::error::test_alert requested but OPS_TELEGRAM_BOT_TOKEN / OPS_TELEGRAM_CHAT_ID secrets are not set"
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/tg_resp -w "%{http_code}" --max-time 20 \
+            "https://api.telegram.org/bot${OPS_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${OPS_CHAT}" \
+            --data-urlencode "text=ops alert test: the monitor's Telegram path works. ${RUN_URL}" \
+            --data-urlencode "disable_web_page_preview=true")
+          if [ "$code" != "200" ]; then
+            echo "::error::Telegram sendMessage returned HTTP $code"
+            cat /tmp/tg_resp || true
+            exit 1
+          fi
+          echo "test alert delivered"
+
+      - name: Probe labeler /health
+        if: ${{ !inputs.test_alert }}
+        run: |
+          if [ "${FORCE_FAIL:-}" = "true" ]; then
+            echo "::error::force_fail dispatch input set — simulating a failed /health probe to exercise the failure alert path"
+            exit 1
+          fi
           code=$(curl -sS -o /tmp/health_body -w "%{http_code}" --max-time 20 \
             https://bsky-labeler.cons.fyi/health || echo 000)
           echo "HTTP $code"
@@ -27,3 +78,71 @@ jobs:
             echo "::error::labeler health check failed (HTTP $code) — ingester may have stalled or the service is down"
             exit 1
           fi
+
+      - name: Alert ops channel (failure)
+        # Pages on every red with no dedup/throttling: a sustained outage sends
+        # one message per run. Accepted — GitHub throttles this schedule to a
+        # handful of runs/day, so the backstop can't spam.
+        if: ${{ !inputs.test_alert && failure() }}
+        run: |
+          if [ -z "$OPS_TOKEN" ] || [ -z "$OPS_CHAT" ]; then
+            echo "::warning::health FAILED but ops Telegram secrets are not set; no alert sent"
+            exit 0
+          fi
+          # curl -o leaves a 0-byte file on total transport failure, so head
+          # succeeds with empty output and the old `|| echo` fallback never
+          # fired. Test emptiness explicitly; `|| true` keeps a missing file
+          # from tripping errexit (this step must always exit 0).
+          body=$(head -c 300 /tmp/health_body 2>/dev/null) || true
+          [ -n "$body" ] || body="(no response body)"
+          code=$(curl -sS -o /tmp/tg_resp -w "%{http_code}" --max-time 20 \
+            "https://api.telegram.org/bot${OPS_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${OPS_CHAT}" \
+            --data-urlencode "text=labeler /health FAILED at $(date -u +%Y-%m-%dT%H:%MZ)
+          ${body}
+          ${RUN_URL}" \
+            --data-urlencode "disable_web_page_preview=true") || code=000
+          if [ "$code" != "200" ]; then
+            echo "::warning::failure alert could not be delivered (Telegram HTTP $code)"
+          else
+            echo "failure alert delivered"
+          fi
+          exit 0
+
+      - name: Recovery notice
+        if: ${{ !inputs.test_alert && success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$OPS_TOKEN" ] || [ -z "$OPS_CHAT" ]; then
+            echo "secrets not set; skipping recovery check"
+            exit 0
+          fi
+          # Stateless recovery detection: if the most recent COMPLETED run of
+          # this workflow (i.e. the one before us) failed, this green run is
+          # the recovery. Scheduled + dispatched runs both count.
+          #
+          # Single-run lookback, accepted limitations:
+          #  - keys only on the prior run's conclusion == failure, so a
+          #    transient or force_fail-induced red yields a spurious "recovered".
+          #  - a cancelled / startup_failure run landing between a real outage
+          #    and this green suppresses the real recovery notice.
+          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/monitor.yml/runs?status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion' 2>/dev/null) || prev=""
+          echo "previous completed run conclusion: ${prev:-unknown}"
+          if [ "$prev" != "failure" ]; then
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/tg_resp -w "%{http_code}" --max-time 20 \
+            "https://api.telegram.org/bot${OPS_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${OPS_CHAT}" \
+            --data-urlencode "text=labeler /health recovered at $(date -u +%Y-%m-%dT%H:%MZ)
+          $(head -c 200 /tmp/health_body 2>/dev/null || true)
+          ${RUN_URL}" \
+            --data-urlencode "disable_web_page_preview=true") || code=000
+          if [ "$code" != "200" ]; then
+            echo "::warning::recovery notice could not be delivered (Telegram HTTP $code)"
+          else
+            echo "recovery notice delivered"
+          fi
+          exit 0
