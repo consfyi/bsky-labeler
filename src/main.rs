@@ -16,15 +16,44 @@ enum Message<'a> {
 #[derive(Copy, Clone)]
 enum EventStreamError {
     FutureCursor,
+    InvalidRequest,
 }
 
 impl EventStreamError {
     pub const fn as_str(&self) -> &str {
         match self {
             Self::FutureCursor => "FutureCursor",
+            Self::InvalidRequest => "InvalidRequest",
         }
     }
 }
+
+/// How far back a subscriber should be replayed, resolved from its requested
+/// cursor and the current max label seq.
+#[derive(Debug, PartialEq, Eq)]
+enum StartSeq {
+    /// Stream labels with `seq > this`.
+    From(i64),
+    /// Cursor is past the tip — the existing `FutureCursor` error.
+    FutureCursor,
+    /// Cursor is negative. Label seqs are >= 1, so this is never valid, and a
+    /// negative value fed to `WHERE seq > $1` would stream the entire table —
+    /// a cheap unauthenticated DoS amplifier. Reject it.
+    Invalid,
+}
+
+fn resolve_start_seq(cursor: Option<i64>, max_seq: i64, empty_cursor_is_zero: bool) -> StartSeq {
+    match cursor {
+        Some(c) if c < 0 => StartSeq::Invalid,
+        Some(c) if c > max_seq => StartSeq::FutureCursor,
+        Some(c) => StartSeq::From(c),
+        None => StartSeq::From(if empty_cursor_is_zero { 0 } else { max_seq }),
+    }
+}
+
+/// Backfill chunk size. Rows are streamed in bounded batches so the pooled DB
+/// connection can be released between network sends (see subscribe_labels).
+const STREAM_CHUNK: i64 = 1000;
 
 fn encode_message(msg: Message) -> Vec<u8> {
     let mut writer = minicbor::Encoder::new(vec![]);
@@ -100,13 +129,16 @@ async fn subscribe_labels(
         atrium_api::com::atproto::label::subscribe_labels::ParametersData,
     >,
 ) -> axum::response::Response {
+    // Note: there is no per-IP connection cap or rate limit here by design.
+    // Bounding concurrent subscriptions / request rate belongs at the reverse
+    // proxy (Cloudflare/nginx) in front of this service, not in-app.
     ws.on_upgrade(move |socket: axum::extract::ws::WebSocket| async move {
         metrics::gauge!("num_subscriptions").increment(1);
 
         let (mut sink, mut stream) = socket.split();
 
         match async {
-            let mut seq = {
+            let max_seq = {
                 let mut db_conn = db_pool.acquire().await?;
                 sqlx::query_scalar!(
                     r#"
@@ -117,12 +149,13 @@ async fn subscribe_labels(
                 .await?
             };
 
-            if let Some(cursor) = params.cursor {
-                if cursor > seq {
+            let mut seq = match resolve_start_seq(params.cursor, max_seq, empty_cursor_is_zero) {
+                StartSeq::From(s) => s,
+                StartSeq::FutureCursor => {
                     log::info!(
                         "got websocket subscriber, cursor = {:?}, seq = {} (future cursor error)",
                         params.cursor,
-                        seq
+                        max_seq
                     );
                     sink.send(axum::extract::ws::Message::Binary(
                         encode_message(Message::Error {
@@ -133,10 +166,21 @@ async fn subscribe_labels(
                     .await?;
                     return Ok::<_, anyhow::Error>(());
                 }
-                seq = cursor;
-            } else if empty_cursor_is_zero {
-                seq = 0;
-            }
+                StartSeq::Invalid => {
+                    log::info!(
+                        "got websocket subscriber, cursor = {:?} (invalid cursor rejected)",
+                        params.cursor,
+                    );
+                    sink.send(axum::extract::ws::Message::Binary(
+                        encode_message(Message::Error {
+                            error: EventStreamError::InvalidRequest,
+                        })
+                        .into(),
+                    ))
+                    .await?;
+                    return Ok::<_, anyhow::Error>(());
+                }
+            };
 
             log::info!(
                 "got websocket subscriber, cursor = {:?}, seq = {}",
@@ -154,30 +198,53 @@ async fn subscribe_labels(
                     }
                     msg = notify_recv.changed() => {
                         msg?;
-                        let mut db_conn = db_pool.acquire().await?;
+                        // Stream in bounded chunks, releasing the pooled DB
+                        // connection before each network send. Previously one
+                        // pooled connection was held for the whole drain loop,
+                        // so a single slow subscriber pinned a connection across
+                        // sink.send() backpressure and ~pool-size slow clients
+                        // exhausted the pool (unauthenticated DoS). ORDER BY seq
+                        // + LIMIT makes `seq > $1` a stable paging cursor.
+                        //
+                        // Runtime query (not the query! macro) so this SQL needs
+                        // no regenerated .sqlx offline cache. It MUST stay a
+                        // static literal with only bound params ($1/$2) —
+                        // query_as isn't compile-checked, so an interpolated
+                        // variant would not be caught offline.
+                        loop {
+                            let rows: Vec<(i64, Vec<u8>)> = {
+                                let mut db_conn = db_pool.acquire().await?;
+                                sqlx::query_as(
+                                    r#"
+                                    SELECT seq, payload
+                                    FROM labels
+                                    WHERE seq > $1
+                                    ORDER BY seq
+                                    LIMIT $2
+                                    "#,
+                                )
+                                .bind(seq)
+                                .bind(STREAM_CHUNK)
+                                .fetch_all(&mut *db_conn)
+                                .await?
+                            };
 
-                        let mut rows = sqlx::query!(
-                            r#"
-                            SELECT seq, payload
-                            FROM labels
-                            WHERE seq > $1
-                            "#,
-                            seq
-                        )
-                        .fetch(&mut *db_conn);
+                            if rows.is_empty() {
+                                break;
+                            }
 
-                        while let Some(row) = rows.next().await {
-                            let row = row?;
+                            for (row_seq, payload) in rows {
+                                sink.send(axum::extract::ws::Message::Binary(
+                                    encode_message(Message::Labels {
+                                        seq: row_seq,
+                                        labels: &[&payload],
+                                    })
+                                    .into(),
+                                ))
+                                .await?;
 
-                            sink.send(axum::extract::ws::Message::Binary(
-                                encode_message(Message::Labels {
-                                    seq: row.seq,
-                                    labels: &[&row.payload],
-                                }).into(),
-                            ))
-                            .await?;
-
-                            seq = row.seq;
+                                seq = row_seq;
+                            }
                         }
                     }
                 };
@@ -334,4 +401,44 @@ async fn main() -> Result<(), anyhow::Error> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartSeq, resolve_start_seq};
+
+    #[test]
+    fn negative_cursor_is_rejected() {
+        // The DoS amplifier: a negative cursor fed to `seq > $1` would scan the
+        // whole table. It must never resolve to From(..).
+        assert_eq!(resolve_start_seq(Some(-1), 100, false), StartSeq::Invalid);
+        assert_eq!(
+            resolve_start_seq(Some(i64::MIN), 100, true),
+            StartSeq::Invalid
+        );
+    }
+
+    #[test]
+    fn future_cursor_is_reported() {
+        assert_eq!(
+            resolve_start_seq(Some(101), 100, false),
+            StartSeq::FutureCursor
+        );
+    }
+
+    #[test]
+    fn valid_cursor_passes_through() {
+        assert_eq!(resolve_start_seq(Some(0), 100, false), StartSeq::From(0));
+        assert_eq!(resolve_start_seq(Some(50), 100, false), StartSeq::From(50));
+        assert_eq!(
+            resolve_start_seq(Some(100), 100, false),
+            StartSeq::From(100)
+        );
+    }
+
+    #[test]
+    fn absent_cursor_uses_tip_or_zero() {
+        assert_eq!(resolve_start_seq(None, 100, false), StartSeq::From(100));
+        assert_eq!(resolve_start_seq(None, 100, true), StartSeq::From(0));
+    }
 }
