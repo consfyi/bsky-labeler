@@ -1,10 +1,23 @@
 use futures::{SinkExt as _, StreamExt as _};
 
-#[derive(serde::Deserialize, Debug)]
+#[derive(serde::Deserialize)]
 struct Config {
     labeler_bind: std::net::SocketAddr,
     postgres_url: String,
     empty_cursor_is_zero: bool,
+}
+
+// Manual Debug so the startup `config: {config:?}` log never prints
+// postgres_url — it can carry credentials in the postgres://user:pass@host
+// form, which would land in journald in cleartext.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("labeler_bind", &self.labeler_bind)
+            .field("postgres_url", &"<redacted>")
+            .field("empty_cursor_is_zero", &self.empty_cursor_is_zero)
+            .finish()
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -405,7 +418,19 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartSeq, resolve_start_seq};
+    use super::{Config, StartSeq, resolve_start_seq};
+
+    #[test]
+    fn config_debug_redacts_postgres_url() {
+        let config = Config {
+            labeler_bind: "127.0.0.1:3001".parse().unwrap(),
+            postgres_url: "postgres://user:secret@host/db".to_string(),
+            empty_cursor_is_zero: false,
+        };
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("secret"));
+    }
 
     #[test]
     fn negative_cursor_is_rejected() {

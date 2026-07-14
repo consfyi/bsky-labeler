@@ -1,1 +1,5 @@
 /target
+
+# Secrets — never commit to this public repo.
+/signing.key
+/config.toml
