@@ -3,3 +3,7 @@
 # Secrets — never commit to this public repo.
 /signing.key
 /config.toml
+
+# local tooling artifacts (review screenshots, wrangler dev state)
+/.ship
+/.wrangler
