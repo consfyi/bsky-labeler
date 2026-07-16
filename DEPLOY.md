@@ -38,8 +38,10 @@ scripts/deploy.sh labeler          # or: scripts/deploy.sh ingester
 ```
 
 It downloads the latest GitHub Release for the service, verifies the sha256
-manifest, snapshots the running binary to `.bak`, swaps atomically (no window
-where the binary is missing), restarts the unit, and confirms it **stays**
+manifest, snapshots the running binary to `.bak` (skipped when the unit is
+down, so a failed deploy can't clobber the last-known-good backup), swaps
+atomically (no window where the binary is missing), restarts the unit, and
+confirms it **stays**
 active (including a re-check one settle interval after it first comes up). That
 unit check is the pass/fail signal. `/health` is reported afterwards as an
 advisory check only — it reflects the ingester's firehose cursor lag, so it can
