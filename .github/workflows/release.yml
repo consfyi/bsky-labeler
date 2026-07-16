@@ -8,8 +8,7 @@ name: release
 # changes nothing on the host.
 #
 # On pull requests that touch this workflow, the build and staging steps run
-# (and the artifact set is uploaded as a workflow artifact) but no release is
-# published.
+# as proof, but no release is published.
 
 on:
   push:
@@ -43,7 +42,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No build cache on purpose: the binary that reaches prod must not share
+      # cached build products with untrusted PR builds.
       - run: cargo build --release --locked --bin bsky-labeler
       - name: Stage artifact set
         run: |
@@ -51,17 +51,14 @@ jobs:
           cp target/release/bsky-labeler stage/
           cd stage
           sha256sum bsky-labeler > SHA256SUMS
-      - name: Upload artifact set (pull request proof, no release)
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: deploy-artifacts
-          path: stage/
       - name: Publish release
         # Only real main builds become releases; a workflow_dispatch on any
         # other ref (possible once this file is on the default branch) must not
-        # publish a branch build as "latest".
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        # publish a branch build as "latest". First attempt only: re-running an
+        # old successful run would republish stale code as the latest release —
+        # deliberate re-cuts go through workflow_dispatch on main (a fresh run,
+        # attempt 1).
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

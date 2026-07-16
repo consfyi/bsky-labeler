@@ -39,10 +39,21 @@ scripts/deploy.sh labeler          # or: scripts/deploy.sh ingester
 
 It downloads the latest GitHub Release for the service, verifies the sha256
 manifest, snapshots the running binary to `.bak`, swaps atomically (no window
-where the binary is missing), restarts the unit, and post-checks `/health`.
-`--version <tag>` deploys a specific release; `--rollback` restores the `.bak`.
-For the ingester it also installs `keydates_worker.py` to its runtime location —
-the step the manual sequence used to leave easy to forget.
+where the binary is missing), restarts the unit, and confirms it **stays**
+active (including a re-check one settle interval after it first comes up). That
+unit check is the pass/fail signal. `/health` is reported afterwards as an
+advisory check only — it reflects the ingester's firehose cursor lag, so it can
+503 innocently right after an ingester restart; it never fails the deploy or
+triggers a rollback. `--version <tag>` deploys a specific release; `--rollback`
+restores the `.bak`. For the ingester it also installs `keydates_worker.py` to
+its runtime location — the step the manual sequence used to leave easy to
+forget.
+
+**Mind the merge-to-release delay:** the release build takes a few minutes, so
+running the updater immediately after a merge fetches the *previous* release.
+Check that the release the updater reports matches your merge (each release's
+notes embed the commit SHA and a link to the workflow run), or pass
+`--version <tag>` explicitly.
 
 ## Fallback: manual build on the host
 
