@@ -81,9 +81,11 @@ printf '%s' "${STUB_CURL_CODE:-200}"
 exit "${STUB_CURL_EXIT:-0}"
 SH
 
-# gh stub: prints STUB_GH_CONCLUSION as the prior run's conclusion, or fails.
+# gh stub: records args (for query-assertions), prints STUB_GH_CONCLUSION as
+# the prior run's conclusion, or fails.
 cat >"$STUB/gh" <<'SH'
 #!/usr/bin/env bash
+[ -n "${STUB_GH_ARGS:-}" ] && printf '%s\n' "$*" >>"$STUB_GH_ARGS"
 [ "${STUB_GH_EXIT:-0}" != "0" ] && exit "$STUB_GH_EXIT"
 printf '%s\n' "${STUB_GH_CONCLUSION:-success}"
 SH
@@ -183,6 +185,19 @@ args="$TMP/rec_nosend"; : >"$args"; rc=0
   || fail "recovery: prior success should exit 0 (got $rc)"
 grep -q "recovered" "$args" && fail "recovery: prior success should NOT send" \
   || pass "recovery: prior success sends nothing"
+
+# ---- (b4) lookback must filter to scheduled runs -----------------------------
+# The lookback keys recovery on the previous run's conclusion, so manual
+# workflow_dispatch runs (test_alert, force_fail) must be excluded: a green
+# test_alert during an outage would otherwise show prev=success and suppress the
+# real recovery notice, and a red dispatch would show prev=failure and fire a
+# spurious "recovered". GitHub does that exclusion when the query carries
+# event=schedule, so assert the gh api URL includes it.
+ghargs="$TMP/rec_ghargs"; : >"$ghargs"; rc=0
+( export OPS_TOKEN="t" OPS_CHAT="c" RUN_URL="u" GITHUB_REPOSITORY="o/r" GH_TOKEN="g" \
+    STUB_GH_CONCLUSION="failure" STUB_CURL_CODE="200" STUB_GH_ARGS="$ghargs"; runblock "Recovery notice" ) >/dev/null 2>&1 || rc=$?
+grep -q "event=schedule" "$ghargs" && pass "recovery: lookback query filters to event=schedule (dispatch runs excluded)" \
+  || fail "recovery: gh api lookback must include event=schedule so test_alert/force_fail can't skew recovery"
 
 echo
 if [ "$FAILURES" -ne 0 ]; then

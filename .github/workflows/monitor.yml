@@ -118,16 +118,22 @@ jobs:
             echo "secrets not set; skipping recovery check"
             exit 0
           fi
-          # Stateless recovery detection: if the most recent COMPLETED run of
-          # this workflow (i.e. the one before us) failed, this green run is
-          # the recovery. Scheduled + dispatched runs both count.
+          # Stateless recovery detection: if the most recent COMPLETED
+          # *scheduled* run of this workflow (i.e. the probe before us) failed,
+          # this green run is the recovery. Filtering to event=schedule keeps
+          # manual workflow_dispatch runs out of the outage/recovery state
+          # machine: a green test_alert can't suppress a real recovery, and a
+          # red dispatch can't manufacture a spurious "recovered".
           #
-          # Single-run lookback, accepted limitations:
-          #  - keys only on the prior run's conclusion == failure, so a
-          #    transient or force_fail-induced red yields a spurious "recovered".
-          #  - a cancelled / startup_failure run landing between a real outage
-          #    and this green suppresses the real recovery notice.
-          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/monitor.yml/runs?status=completed&per_page=1" \
+          # Single scheduled-run lookback, accepted limitations:
+          #  - keys only on the prior scheduled run's conclusion == failure, so
+          #    a transient scheduled red yields a spurious "recovered".
+          #  - a cancelled / startup_failure scheduled run landing between a real
+          #    outage and this green suppresses the real recovery notice.
+          #  - force_fail exercises the failure->Telegram alert path on its own
+          #    red run (its documented purpose); it no longer feeds the lookback,
+          #    so the failure->recovery cycle can't be rehearsed via dispatch.
+          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/monitor.yml/runs?status=completed&event=schedule&per_page=1" \
             --jq '.workflow_runs[0].conclusion' 2>/dev/null) || prev=""
           echo "previous completed run conclusion: ${prev:-unknown}"
           if [ "$prev" != "failure" ]; then
