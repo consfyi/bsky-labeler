@@ -24,6 +24,7 @@ jobs:
       # --locked so lockfile drift fails here on the PR, not only in the
       # post-merge release build.
       - run: cargo build --locked --all-targets
+      - run: cargo test
 
   lint:
     name: lint
