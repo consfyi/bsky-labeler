@@ -1,0 +1,74 @@
+name: release
+
+# Builds the deployable labeler binary + checksums and publishes them as a
+# GitHub Release on every push to main (bsky-labeler#8, companion to
+# bsky-event-ingester#7). The droplet-side updater
+# (bsky-event-ingester/scripts/deploy.sh) consumes these releases, so the box
+# never has to compile. Deploys stay operator-triggered: publishing a release
+# changes nothing on the host.
+#
+# On pull requests that touch this workflow, the build and staging steps run
+# as proof, but no release is published.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One release build at a time so two quick merges can't race on the "latest"
+# release marker.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+jobs:
+  release:
+    name: build and publish deploy artifact
+    # Pinned (not ubuntu-latest): the binary is dynamically linked, so the build
+    # image's glibc/openssl must not silently move ahead of what the droplet
+    # ships. 24.04's glibc 2.39 / libssl.so.3 are forward-compatible with the
+    # current host.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # No build cache on purpose: the binary that reaches prod must not share
+      # cached build products with untrusted PR builds.
+      - run: cargo build --release --locked --bin bsky-labeler
+      - name: Stage artifact set
+        run: |
+          mkdir stage
+          cp target/release/bsky-labeler stage/
+          cd stage
+          sha256sum bsky-labeler > SHA256SUMS
+      - name: Publish release
+        # Only real main builds become releases; a workflow_dispatch on any
+        # other ref (possible once this file is on the default branch) must not
+        # publish a branch build as "latest". First attempt only: re-running an
+        # old successful run would republish stale code as the latest release —
+        # deliberate re-cuts go through workflow_dispatch on main (a fresh run,
+        # attempt 1).
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="deploy-${{ github.run_number }}.${{ github.run_attempt }}-${GITHUB_SHA::7}"
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --latest \
+            --title "Deploy build ${GITHUB_SHA::7}" \
+            --notes "Automated deploy artifact for ${GITHUB_SHA}.
+          Install with \`scripts/deploy.sh labeler\` from the ingester checkout on the host (see DEPLOY.md).
+          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            stage/bsky-labeler \
+            stage/SHA256SUMS
