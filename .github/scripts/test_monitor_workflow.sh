@@ -111,6 +111,12 @@ runblock() {
   PATH="$STUB:$PATH" bash --noprofile --norc -eo pipefail "$TMP/run.sh"
 }
 
+# ---- (b0) "Probe labeler /health" — force_fail must exit non-zero without a network call --
+rc=0
+( export FORCE_FAIL="true"; runblock "Probe labeler /health" ) >/dev/null 2>&1 || rc=$?
+[ "$rc" != 0 ] && pass "probe: force_fail -> exit $rc (non-zero)" \
+  || fail "probe: force_fail should be non-zero (got $rc)"
+
 # ---- (b1) "Send test alert" — must FAIL loudly when unusable ------------------
 rc=0
 ( export OPS_TOKEN="" OPS_CHAT="c" RUN_URL="u"; runblock "Send test alert" ) >/dev/null 2>&1 || rc=$?
